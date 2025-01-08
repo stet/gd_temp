@@ -1,0 +1,208 @@
+/*
+ * Copyright (c) 2023 Brian Barto
+ * 
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GPL License. See LICENSE for more details.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+
+#include "btk_vanity.h"
+#include "btk_help.h"
+#include "btk_version.h"
+#include "btk_config.h"
+
+#include "../mods/output.h"
+#include "../mods/opts.h"
+#include "../mods/error.h"
+#include "../mods/debug.h"
+#include "../mods/gd_vanity.h"
+
+// ANSI color codes
+#define ANSI_RESET   "\x1b[0m"
+#define ANSI_BOLD    "\x1b[1m"
+#define ANSI_RED     "\x1b[31m"
+#define ANSI_GREEN   "\x1b[32m"
+#define ANSI_YELLOW  "\x1b[33m"
+#define ANSI_BLUE    "\x1b[34m"
+#define ANSI_MAGENTA "\x1b[35m"
+#define ANSI_CYAN    "\x1b[36m"
+
+// Unicode emojis
+#define EMOJI_PICKAXE    "⛏️ "
+#define EMOJI_SPARKLES   "✨ "
+#define EMOJI_ROCKET     "🚀 "
+#define EMOJI_CHECK      "✅ "
+#define EMOJI_BITCOIN    "₿ "
+#define EMOJI_SEARCH     "🔍 "
+#define EMOJI_HOURGLASS  "⏰ "
+#define EMOJI_KEY        "🔑 "
+
+static void progress_callback(const vanity_stats_t *stats) {
+    printf("\r%s%s Searching... %s%zu%s attempts at %s%.1f%s k/s%s",
+           ANSI_BOLD, EMOJI_HOURGLASS,
+           ANSI_CYAN, stats->attempts,
+           ANSI_RESET,
+           ANSI_CYAN, stats->keys_per_sec/1000,
+           ANSI_RESET,
+           ANSI_RESET);
+    fflush(stdout);
+}
+
+int btk_vanity_main(output_item *output, opts_p opts, unsigned char *input, size_t input_len)
+{
+    char pattern_buf[128];
+    bool case_sensitive = false;
+    uint32_t num_threads = 1;  // Default to 1 thread
+    pattern_mode_t mode = PATTERN_MODE_ANYWHERE;  // Default mode
+    const char *pattern = NULL;
+    bool next_is_pattern = false;
+    
+    printf("%s%s Starting vanity address generator...%s\n", ANSI_BOLD, EMOJI_ROCKET, ANSI_RESET);
+    
+    // Initialize debug level
+    debug_init(DEBUG_TRACE);
+    
+    // Parse command line options
+    if (opts->input_count < 1) {
+        printf("%s%s Error: Pattern not specified%s\n", ANSI_RED, EMOJI_CHECK, ANSI_RESET);
+        return -1;
+    }
+
+    // Skip the "vanity" command if present
+    int start_idx = 0;
+    if (opts->input_count > 0 && strcmp(opts->input[0], "vanity") == 0) {
+        start_idx = 1;
+    }
+    
+    // Parse arguments
+    for (int i = start_idx; i < opts->input_count; i++) {
+        if (next_is_pattern) {
+            pattern = opts->input[i];
+            next_is_pattern = false;
+            continue;
+        }
+        
+        if (strcmp(opts->input[i], "-i") == 0) {
+            case_sensitive = false;
+        } else if (strcmp(opts->input[i], "--threads") == 0 && i + 1 < opts->input_count) {
+            opts->threads = atoi(opts->input[++i]);
+            if (opts->threads < 1) {
+                printf("%s%s Error: Thread count must be greater than 0%s\n", ANSI_RED, EMOJI_CHECK, ANSI_RESET);
+                return -1;
+            }
+            num_threads = (uint32_t)opts->threads;
+        } else if (strcmp(opts->input[i], "-t") == 0 && i + 1 < opts->input_count) {
+            opts->threads = atoi(opts->input[++i]);
+            if (opts->threads < 1) {
+                printf("%s%s Error: Thread count must be greater than 0%s\n", ANSI_RED, EMOJI_CHECK, ANSI_RESET);
+                return -1;
+            }
+            num_threads = (uint32_t)opts->threads;
+        } else if (strcmp(opts->input[i], "prefix") == 0) {
+            mode = PATTERN_MODE_PREFIX;
+            next_is_pattern = true;
+        } else if (strcmp(opts->input[i], "suffix") == 0) {
+            mode = PATTERN_MODE_SUFFIX;
+            next_is_pattern = true;
+        } else if (strcmp(opts->input[i], "anywhere") == 0) {
+            mode = PATTERN_MODE_ANYWHERE;
+            next_is_pattern = true;
+        } else {
+            // If not a mode flag, treat as pattern
+            pattern = opts->input[i];
+        }
+    }
+
+    // Pattern must be specified
+    if (!pattern) {
+        printf("%s%s Error: Pattern not specified%s\n", ANSI_RED, EMOJI_CHECK, ANSI_RESET);
+        return -1;
+    }
+
+    // Copy pattern
+    strncpy(pattern_buf, pattern, sizeof(pattern_buf)-1);
+    pattern_buf[sizeof(pattern_buf)-1] = '\0';
+    
+    const char *mode_str;
+    switch (mode) {
+        case PATTERN_MODE_PREFIX:
+            mode_str = "prefix";
+            break;
+        case PATTERN_MODE_SUFFIX:
+            mode_str = "suffix";
+            break;
+        default:
+            mode_str = "anywhere";
+            break;
+    }
+    
+    printf("%s%s Pattern:%s %s (%smode: %s%s)\n", 
+           ANSI_BOLD, EMOJI_SEARCH, ANSI_RESET,
+           pattern_buf,
+           ANSI_CYAN, mode_str, ANSI_RESET);
+
+    // Use thread count from opts
+    num_threads = (uint32_t)opts->threads;
+    if (num_threads < 1) num_threads = 1;
+
+    printf("%s%s Using %u threads%s\n", ANSI_BOLD, EMOJI_ROCKET, num_threads, ANSI_RESET);
+
+    // Initialize vanity search
+    if (gd_vanity_init(num_threads) != 0) {
+        printf("%s%s Error: Failed to initialize vanity search%s\n", ANSI_RED, EMOJI_CHECK, ANSI_RESET);
+        return -1;
+    }
+
+    // Set pattern matching mode
+    gd_vanity_set_mode(mode);
+
+    // Set progress callback
+    gd_vanity_set_progress_callback(progress_callback);
+
+    // Start search
+    if (gd_vanity_start(pattern_buf, case_sensitive) < 0) {
+        printf("%s%s Error: Failed to start vanity search%s\n", ANSI_RED, EMOJI_CHECK, ANSI_RESET);
+        gd_vanity_cleanup();
+        return -1;
+    }
+
+    // Get WIF private key and address if found
+    char wif[53];
+    char address[35];
+    if (gd_vanity_get_wif(wif, sizeof(wif)) == 0 && 
+        gd_vanity_get_address(address, sizeof(address)) == 0) {
+        printf("\n%s%s Found matching address!%s\n", ANSI_BOLD, EMOJI_SPARKLES, ANSI_RESET);
+        printf("%s%s Address:%s %s\n", ANSI_BOLD, EMOJI_BITCOIN, ANSI_RESET, address);
+        printf("%s%s Private key (WIF):%s %s\n", ANSI_BOLD, EMOJI_KEY, ANSI_RESET, wif);
+    }
+
+    // Cleanup
+    gd_vanity_cleanup();
+    
+    return 0;
+}
+
+int btk_vanity_help(output_item *output) {
+    output_printf(output, "%s%s vanity - Generate a Bitcoin vanity address%s\n\n", ANSI_BOLD, EMOJI_BITCOIN, ANSI_RESET);
+    output_printf(output, "%s Options:%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  prefix              Search for pattern at the start of the address%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  suffix              Search for pattern at the end of the address%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  anywhere            Search for pattern anywhere in the address (default)%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  -i, --case-insensitive    Case insensitive match (default)%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  -t, --threads N    Number of threads to use (default: 1)%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "\n");
+    output_printf(output, "%s Examples:%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  btk vanity abc%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  btk vanity prefix abc%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  btk vanity suffix xyz%s\n", ANSI_BOLD, ANSI_RESET);
+    output_printf(output, "%s  btk vanity -t 8 abc%s\n", ANSI_BOLD, ANSI_RESET);
+    return 0;
+}
